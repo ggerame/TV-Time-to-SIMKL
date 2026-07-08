@@ -11,6 +11,7 @@ SQLite database for caching confirmed IDs and resuming jobs.
 ## Features
 
 - Web UI: upload a TV Time GDPR export ZIP, review matches, download a ready-to-import ZIP.
+- Two export formats: a SIMKL backup ZIP (`SimklBackup.json`) or a [SIMKL bulk-import CSV](https://simkl.com/apps/import) - plus a raw CSV export of the review table itself for offline review.
 - Optional prefill of IMDb/TVDB IDs from a `TV Time Out by Refract` export ZIP.
 - IMDb-first matching: resolves an IMDb ID from the title via IMDb's search first, then asks SIMKL for that exact IMDb ID. This fixes SIMKL's free-text search often failing on numeric/punctuated titles (e.g. "9-1-1", "The 100", "1899"). Falls back to SIMKL's own title/year search (via `/redirect` and search endpoints, with confidence scoring) when IMDb has no confident match.
 - Anime detection via TVmaze: since the TV Time export has no genre data, TVmaze's genre tags (looked up by the resolved IMDb ID) are used to try SIMKL's "anime" catalog before "tv" for shows TVmaze tags as anime.
