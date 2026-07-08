@@ -189,8 +189,7 @@ python -m pytest
   does not identify anime offline at all); TVmaze's genre tags help bias
   matching toward SIMKL's anime catalog once an IMDb ID is resolved, but a
   row can still be reclassified manually in the review table if needed.
-- TV Time ratings are counted in the summary but not imported, since SIMKL
-  backups have no equivalent field for them.
+- I have no idea on how TV Time ratings are stored.
 - IMDb matching relies on an undocumented, unofficial endpoint that could
   change or disappear without notice. The app is resilient to that (it just
   falls back to SIMKL's own search), but exact match rates may vary if IMDb
@@ -203,6 +202,7 @@ python -m pytest
   process while the app is running; the SQLite mirror lets a completed job be
   resumed after a restart, but an in-progress conversion is lost if the
   server stops before it finishes.
+- SIMKL just put also JSON import behind payment... just use the CSV.
 
 ## Privacy
 
