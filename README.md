@@ -1,7 +1,7 @@
 # Watch History Bridge (TV Time to SIMKL, Python / NiceGUI)
 
 Convert a [TV Time](https://www.tvtime.com/) GDPR data export into a
-[SIMKL](https://simkl.com/) JSON import backup, with a web-based review step
+[SIMKL](https://simkl.com/) JSON and CSV import backup, with a web-based review step
 so you can check (and fix) the SIMKL/IMDb/TVDB IDs before downloading the
 final file.
 

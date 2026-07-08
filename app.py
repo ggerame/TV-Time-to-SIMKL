@@ -186,11 +186,17 @@ def build_grid_options() -> dict[str, Any]:
         ],
         "rowData": [],
         "stopEditingWhenCellsLoseFocus": True,
-        "rowClassRules": {
-            "bg-green-50": "data.status_label == 'Matched'",
-            "bg-red-50": "data.status_label == 'Unmatched'",
-            "bg-yellow-50": "data.status_label == 'Edited'",
-        },
+        # Row status colors are applied via getRowStyle (inline style) rather than
+        # rowClassRules, because AG Grid's own theme CSS (Quartz, in NiceGUI 3.14+)
+        # sets the row background with higher precedence than a plain utility
+        # class, so a class-based approach silently has no visible effect.
+        ":getRowStyle": (
+            "(params) => ({"
+            "  'Matched': {backgroundColor: '#f0fdf4'},"
+            "  'Unmatched': {backgroundColor: '#fef2f2'},"
+            "  'Edited': {backgroundColor: '#fefce8'},"
+            "}[params.data && params.data.status_label])"
+        ),
         ":getRowId": "(params) => params.data.id",
     }
 
