@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.pytest_cache/
+
+# Local SQLite database (ID mapping cache + jobs) - contains personal data.
+data/
+*.sqlite3
+
+# Personal data - never commit real exports or generated backups.
+*.zip
+SimklBackup*.json
+not_found*.json
+output/
