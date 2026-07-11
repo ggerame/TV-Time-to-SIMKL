@@ -57,6 +57,17 @@ class DirectSyncResult:
     failed_items: list[dict[str, str]] = field(default_factory=list)
 
 
+def direct_sync_status_counts(plan: DirectSyncPlan) -> dict[str, dict[str, int]]:
+    """Count planned watchlist updates by status and media bucket."""
+    counts: dict[str, dict[str, int]] = {}
+    for batch in plan.status_batches:
+        status = str(batch["to"])
+        status_counts = counts.setdefault(status, {"shows": 0, "anime": 0, "movies": 0})
+        for bucket in status_counts:
+            status_counts[bucket] += len(batch.get(bucket, []))
+    return counts
+
+
 FAILED_IMPORT_CSV_HEADER = [
     "reason", "phase", "source_type", "target_type", "title", "year",
     "simkl_id", "imdb_id", "tvdb_id", "tmdb_id", "watch_status",

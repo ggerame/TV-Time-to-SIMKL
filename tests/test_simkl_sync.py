@@ -10,6 +10,7 @@ from src.simkl_sync import (
     build_direct_sync_plan,
     build_failed_import_csv,
     direct_sync_issue_reasons,
+    direct_sync_status_counts,
     sync_job_directly,
 )
 
@@ -52,6 +53,11 @@ def test_direct_sync_separates_history_from_final_statuses():
     assert statuses["plantowatch"]["shows"][0]["title"] == "Planned Show"
     assert statuses["completed"]["movies"][0]["title"] == "Seen Movie"
     assert plan.skipped_unmatched == []
+    assert direct_sync_status_counts(plan) == {
+        "plantowatch": {"shows": 1, "anime": 0, "movies": 0},
+        "dropped": {"shows": 1, "anime": 0, "movies": 0},
+        "completed": {"shows": 0, "anime": 0, "movies": 1},
+    }
 
 
 def test_direct_sync_writes_history_before_statuses():

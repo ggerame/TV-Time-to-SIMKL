@@ -45,6 +45,7 @@ from src.simkl_sync import (
     build_direct_sync_plan,
     build_failed_import_csv,
     direct_sync_issue_reasons,
+    direct_sync_status_counts,
     sync_job_directly,
 )
 from src.sqlite_store import SqliteStore
@@ -677,12 +678,35 @@ def index() -> None:
                     for batch in plan.status_batches
                     for bucket in ("shows", "anime", "movies")
                 )
+                status_counts = direct_sync_status_counts(plan)
+                status_labels = {
+                    "watching": "Watching", "plantowatch": "Plan to watch", "hold": "On hold",
+                    "dropped": "Dropped", "completed": "Completed",
+                }
+                bucket_labels = {"shows": "TV shows", "anime": "anime", "movies": "movies"}
+                status_summary = []
+                for status in ("watching", "plantowatch", "hold", "dropped", "completed"):
+                    buckets = status_counts.get(status, {})
+                    parts = [
+                        f"{count} {bucket_labels[bucket]}"
+                        for bucket, count in buckets.items()
+                        if count
+                    ]
+                    if parts:
+                        status_summary.append(f"{status_labels[status]}: {', '.join(parts)}")
+                logger.info(
+                    "Direct SIMKL import plan job_id=%s history_items=%d status_counts=%s",
+                    job.id, history_items, status_counts,
+                )
                 with ui.dialog() as confirm_dialog, ui.card().classes("gap-3"):
                     ui.label("Import this reviewed history directly into SIMKL?").classes("text-lg font-semibold")
+                    ui.label(f"Import ID: {job.id}").classes("text-sm font-mono")
                     ui.label(
                         f"Ready to sync {history_items} watched titles and apply {status_items} watchlist states. "
                         "The app will not remove existing history.",
                     ).classes("max-w-lg text-sm text-gray-700")
+                    for summary_line in status_summary:
+                        ui.label(summary_line).classes("text-sm text-gray-700")
                     if plan.failed_items:
                         ui.label(
                             f"A detailed CSV report will be downloaded automatically for the "
