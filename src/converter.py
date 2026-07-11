@@ -165,6 +165,44 @@ def _get_movie(movies: dict[str, MovieAccumulator], key: str, title: str, year: 
     return movie
 
 
+def _reconcile_movie_years(
+    movies: dict[str, MovieAccumulator],
+    planned_movies: dict[str, MovieAccumulator],
+    rewatch_movies: dict[str, MovieAccumulator],
+) -> tuple[dict[str, MovieAccumulator], dict[str, MovieAccumulator]]:
+    all_movies = [*movies.values(), *planned_movies.values(), *rewatch_movies.values()]
+    known_years: dict[str, set[int]] = {}
+    for movie in all_movies:
+        if movie.year is not None:
+            known_years.setdefault(normalize_key(movie.title), set()).add(movie.year)
+
+    for movie in all_movies:
+        candidate_years = known_years.get(normalize_key(movie.title), set())
+        if movie.year is None and len(candidate_years) == 1:
+            movie.year = next(iter(candidate_years))
+            movie.base_key = _movie_base_key(movie.title, movie.year)
+
+    def merge_by_base_key(collection: dict[str, MovieAccumulator]) -> dict[str, MovieAccumulator]:
+        merged: dict[str, MovieAccumulator] = {}
+        for movie in collection.values():
+            existing = merged.get(movie.base_key)
+            if existing is None:
+                merged[movie.base_key] = movie
+                continue
+            existing.added_at = _min_date(existing.added_at, movie.added_at)
+            existing.last_watched_at = _max_date(existing.last_watched_at, movie.last_watched_at)
+        return merged
+
+    merged_movies = merge_by_base_key(movies)
+    merged_planned_movies = merge_by_base_key(planned_movies)
+    for key, watched_movie in merged_movies.items():
+        planned_movie = merged_planned_movies.get(key)
+        if planned_movie is not None:
+            watched_movie.added_at = _min_date(watched_movie.added_at, planned_movie.added_at)
+
+    return merged_movies, merged_planned_movies
+
+
 def _make_report(source: str, row: int, type_: str, reason: str, action: str) -> dict[str, Any]:
     return {"source": source, "row": row, "type": type_, "reason": reason, "action": action}
 
@@ -538,6 +576,7 @@ def convert_tvtime_to_simkl_json(
             ignored_movie_counter_rows += 1
         done += 1
     progress("movies", done, total)
+    movies, planned_movies = _reconcile_movie_years(movies, planned_movies, rewatch_movies)
 
     progress("ratings", done, total)
     unsupported_ratings = 0
@@ -599,6 +638,8 @@ def convert_tvtime_to_simkl_json(
         "TV Time ratings are counted in the summary, but they are not added to the JSON or failure report.",
         "The TV Time export does not include public SIMKL/TMDB/TVDB/IMDB IDs in most CSV files used here, "
         "so the JSON uses titles and years when available.",
+        "The TV Time GDPR export does not preserve continuing/up-to-date/stopped show states. "
+        "Provide a TV Time Out export to recover them automatically, or edit Watch status during review.",
         "Anime starts empty because the TV Time export does not identify anime reliably offline.",
     ]
 

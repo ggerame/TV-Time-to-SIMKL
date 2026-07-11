@@ -1,9 +1,13 @@
 """Unit tests for SIMKL matching/scoring helpers that don't require network access."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 
-from src.simkl_client import clean_imdb_id, normalize_title, parse_simkl_location, score_candidate
+import httpx
+
+from src.simkl_client import SimklClient, clean_imdb_id, normalize_title, parse_simkl_location, score_candidate
 
 
 @dataclass
@@ -77,3 +81,73 @@ def test_score_candidate_different_title_scores_low():
     item = {"title": "Better Call Saul", "year": 2015, "type": "tv"}
     score = score_candidate(record, item, "tv")
     assert score < 40
+
+
+def test_pin_and_authenticated_sync_requests():
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/oauth/pin":
+            return httpx.Response(200, json={
+                "result": "OK", "user_code": "ABCDE", "verification_uri": "https://simkl.com/pin",
+            })
+        if request.url.path == "/oauth/pin/ABCDE":
+            return httpx.Response(200, json={"result": "OK", "access_token": "secret-token"})
+        return httpx.Response(201, json={"added": {}, "not_found": {"shows": [], "movies": []}})
+
+    async def scenario():
+        client = SimklClient(
+            "client-123", base_url="https://api.simkl.test", min_delay_ms=0,
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            pin = await client.request_pin()
+            token = await client.check_pin(pin["user_code"])
+            await client.post_user_data(
+                "/sync/history", {"shows": [{"ids": {"simkl": 1}}]}, token,
+                params={"skip_auto_watching": "yes"},
+            )
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+
+    sync_request = requests[-1]
+    assert sync_request.method == "POST"
+    assert sync_request.headers["Authorization"] == "Bearer secret-token"
+    assert sync_request.headers["simkl-api-key"] == "client-123"
+    assert sync_request.url.params["client_id"] == "client-123"
+    assert sync_request.url.params["skip_auto_watching"] == "yes"
+
+
+def test_authenticated_sync_debug_log_shows_serialized_body_without_credentials(caplog):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "empty_field"})
+
+    async def scenario():
+        client = SimklClient(
+            "client-123", base_url="https://api.simkl.test", min_delay_ms=0,
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            try:
+                await client.post_user_data(
+                    "/sync/add-to-list",
+                    {"shows": [{"to": "dropped", "ids": {"simkl": 1}}]},
+                    "secret-token",
+                )
+            except Exception:
+                pass
+        finally:
+            await client.aclose()
+
+    with caplog.at_level(logging.DEBUG, logger="tvtime_simkl.simkl_client"):
+        asyncio.run(scenario())
+
+    log_text = caplog.text
+    assert "payload_summary={'shows': 1, 'shows_to': ['dropped']}" in log_text
+    assert 'body={"shows":[{"to":"dropped","ids":{"simkl":1}}]}' in log_text
+    assert "status=400" in log_text
+    assert "secret-token" not in log_text
+    assert "client-123" not in log_text

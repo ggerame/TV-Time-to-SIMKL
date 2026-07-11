@@ -12,7 +12,7 @@ SQLite database for caching confirmed IDs and resuming jobs.
 
 - Web UI: upload a TV Time GDPR export ZIP, review matches, download a ready-to-import ZIP.
 - Two export formats: a SIMKL backup ZIP (`SimklBackup.json`) or a [SIMKL bulk-import CSV](https://simkl.com/apps/import) - plus a raw CSV export of the review table itself for offline review.
-- Optional prefill of IMDb/TVDB IDs from a `TV Time Out by Refract` export ZIP.
+- Optional preservation of show-list states and prefill of IMDb/TVDB IDs from a `TV Time Out by Refract` export ZIP.
 - IMDb-first matching: resolves an IMDb ID from the title via IMDb's search first, then asks SIMKL for that exact IMDb ID. This fixes SIMKL's free-text search often failing on numeric/punctuated titles (e.g. "9-1-1", "The 100", "1899"). Falls back to SIMKL's own title/year search (via `/redirect` and search endpoints, with confidence scoring) when IMDb has no confident match.
 - Anime detection via TVmaze: since the TV Time export has no genre data, TVmaze's genre tags (looked up by the resolved IMDb ID) are used to try SIMKL's "anime" catalog before "tv" for shows TVmaze tags as anime.
 - Editable review table (SIMKL ID, IMDb ID, TVDB ID, type) with status coloring (found / changed / not found), search and filters.
@@ -95,10 +95,16 @@ does not use OAuth or an access token.
 2. Request your GDPR data export and wait for TV Time to prepare it (this can take hours).
 3. Download the ZIP once ready and upload it in the app.
 
-### TV Time Out by Refract export (optional, recommended)
+### TV Time Out by Refract export (optional)
 
-This ZIP is optional but improves matching accuracy by prefilling IMDb/TVDB
-IDs before SIMKL lookups happen.
+The GDPR ZIP contains watch history, but it does not expose TV Time's show-list
+state (`continuing`, `up_to_date`, `stopped`, or `not_started_yet`). The current
+TV Time Out export does, so provide this second ZIP when those states should be
+carried over automatically. It also prefills IMDb/TVDB IDs and improves matching.
+
+Without this ZIP the conversion still works: watched episodes and movies are
+imported, show states are initially inferred as watching/plan-to-watch, and every
+state can be corrected in the review table before download.
 
 1. Install/open the Chrome extension [TV Time Out by Refract](https://chromewebstore.google.com/detail/tv-time-out-by-refract/pmejpdpjbkjklfceogdkolmgclldogbi).
 2. Export the same TV Time account, format `Both`, with `Bundle as ZIP` enabled.
@@ -115,7 +121,8 @@ table:
 
 You can:
 
-- Edit the `SIMKL ID`, `IMDb ID`, `TVDB ID`, and `Type` cells directly in the table.
+- Edit the `Watch status`, `SIMKL ID`, `IMDb ID`, `TVDB ID`, and `Type` cells directly in the table.
+- TV Time Out show states are translated as `continuing` → watching, `up_to_date` → completed, `stopped` → dropped, and `not_started_yet` → plan to watch.
 - Click the 🔍 icon on a row to search that title on IMDb (via Google), and the 🗑 icon to drop a title from the export entirely.
 - Click **Re-check edited rows** to re-check edited rows against the SIMKL API.
 - Click **Remember these matches** to cache confirmed IDs locally, so future imports need less manual work.
@@ -124,6 +131,60 @@ You can:
 - Choose which categories (TV shows / Movies / Anime) to include in the export.
 - Click **Download SIMKL backup** to download the final `SimklBackup-<timestamp>.zip`, containing `SimklBackup.json` - SIMKL's JSON import format.
 - Click **Download SIMKL CSV** to instead download a `SimklImport-<timestamp>.csv` in [SIMKL's own bulk-import CSV format](https://simkl.com/apps/import) (`simkl_id, TVDB_ID, TMDB, IMDB_ID, MAL_ID, Type, Title, Year, LastEpWatched, Watchlist, WatchedDate, Rating, Memo`) - a simpler alternative some tools/workflows expect instead of the JSON backup. This format has no concept of rewatches or per-episode detail, so if a title has both a regular watch and a rewatch entry, only the regular one is included; `TMDB`, `MAL_ID`, `Rating` and `Memo` are always blank since TV Time exports don't carry that data.
+
+## Direct SIMKL import
+
+The reviewed job can be written directly to the SIMKL account instead of
+downloading and uploading a JSON/CSV file. Direct import uses the official
+Sync API in two ordered phases:
+
+1. `/sync/history` adds the watched movies and exact watched episodes. The
+  request uses `skip_auto_watching=yes`, so SIMKL does not infer extra episodes.
+2. `/sync/add-to-list` applies explicit reviewed states (`plantowatch`, `hold`,
+  `dropped`, or `completed`) by placing the required `to` field on each movie or
+  show object. This endpoint also updates titles already present in the account,
+  unlike file imports that skip duplicates.
+
+For watched shows, the GDPR converter initially uses `watching` because TV Time's
+GDPR export does not say whether a show is continuing or up to date. Direct sync
+does not send that generic fallback back through `/sync/add-to-list`: the response
+from `/sync/history` is allowed to determine `watching` versus `completed` from
+the exact watched episodes and SIMKL's catalog. This prevents an ended, fully
+watched show from being moved back to `watching`. Explicit states recovered from
+TV Time Out or selected in the review table are still applied normally.
+
+Click **Connect SIMKL**, open the displayed SIMKL PIN page, authorize the app,
+then click **Check authorization**. The access token is kept only in the current
+browser-page session and is not written to SQLite or `.env`. After connection,
+click **Import directly to SIMKL** and review the preflight counts before confirming.
+
+If an earlier file import populated the account incorrectly, the cleanest path is:
+
+1. Download a SIMKL backup if anything in the account must be retained.
+2. Open <https://simkl.com/settings/login/clean-or-delete/> and choose **Delete all
+  watch history, etc.** Do not delete the SIMKL account itself.
+3. Return to this app and run **Import directly to SIMKL** once.
+
+A reset is not required for ordinary repairs: the Sync API can move existing
+items between watchlists without removing watched episodes. SIMKL may still
+change `completed` to `watching` for a show that its catalog marks as currently
+airing; this is enforced server-side.
+
+Direct sync currently imports canonical watch history and final list states.
+If any item cannot be imported, the browser automatically downloads a
+`SimklDirectImportFailures-<timestamp>.csv` report after direct sync. The report
+includes titles skipped during planning and items rejected as `not_found` by
+SIMKL, with their IDs, media types, status, phase, and failure reason.
+The review grid's **Direct sync issues** view shows these known limitations
+before import. It is intentionally separate from **Unmatched**: a title can have
+a valid SIMKL match while one of its rewatch sessions still needs separate
+handling.
+
+Rewatch sessions are included in this failure report but skipped by direct
+sync: SIMKL exposes API rewatch writes only for Pro/VIP accounts and requires
+non-retriable, session-pinned handling to avoid creating duplicate sessions.
+JSON download remains available when preserving TV Time rewatch entries is more
+important than direct sync.
 
 ## Jobs
 

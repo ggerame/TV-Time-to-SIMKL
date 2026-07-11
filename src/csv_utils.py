@@ -176,7 +176,10 @@ def normalize_date(value: Any) -> str | None:
 def year_from_date(value: Any) -> int | None:
     """Extract a leading 4-digit year from a date-like string."""
     match = re.match(r"^\s*(\d{4})", str(value or ""))
-    return int(match.group(1)) if match else None
+    if not match:
+        return None
+    year = int(match.group(1))
+    return year if year >= 1800 else None
 
 
 def extract_trailing_number(value: Any) -> int | None:

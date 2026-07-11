@@ -12,6 +12,7 @@ It implements:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 import unicodedata
@@ -38,6 +39,19 @@ _ARTICLE_RE = re.compile(r"^(the|a|an)\s+")
 _NON_WORD_RE = re.compile(r"[^\w ]+", re.UNICODE)
 _MULTI_SPACE_RE = re.compile(r"\s+")
 _LOCATION_RE = re.compile(r"/(tv|anime|movies?|movie)/(\d+)", re.IGNORECASE)
+logger = logging.getLogger("tvtime_simkl.simkl_client")
+
+
+def _payload_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Summarize a sync payload while keeping its routing fields visible."""
+    summary: dict[str, Any] = {}
+    for key, value in payload.items():
+        summary[key] = len(value) if isinstance(value, list) else value
+        if isinstance(value, list):
+            targets = sorted({str(item["to"]) for item in value if isinstance(item, dict) and item.get("to")})
+            if targets:
+                summary[f"{key}_to"] = targets
+    return summary
 
 
 @dataclass
@@ -239,6 +253,7 @@ class SimklClient:
         min_delay_ms: int = 110,
         timeout_ms: int = 20000,
         on_retry: Optional[Callable[[dict[str, Any]], None]] = None,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
         if not client_id:
             raise ValueError("Missing SIMKL client_id.")
@@ -254,6 +269,7 @@ class SimklClient:
         self._http = httpx.AsyncClient(
             timeout=None if timeout_ms <= 0 else timeout_ms / 1000,
             headers={"User-Agent": f"{app_name}/{app_version}"},
+            transport=transport,
         )
 
     async def aclose(self) -> None:
@@ -275,7 +291,9 @@ class SimklClient:
         self._last_request_at = time.monotonic() * 1000
 
     async def _request(
-        self, path: str, params: dict[str, Any], *, follow_redirects: bool = True, accept_json: bool = True,
+        self, path: str, params: dict[str, Any], *, method: str = "GET",
+        json_body: Optional[dict[str, Any]] = None, access_token: str = "",
+        follow_redirects: bool = True, accept_json: bool = True,
     ) -> httpx.Response:
         query = {
             **{k: v for k, v in params.items() if v not in (None, "")},
@@ -288,11 +306,17 @@ class SimklClient:
         for attempt in range(1, 6):
             await self._wait_turn()
             try:
-                response = await self._http.get(
+                headers = {"Accept": "application/json" if accept_json else "*/*"}
+                if access_token:
+                    headers["Authorization"] = f"Bearer {access_token}"
+                    headers["simkl-api-key"] = self.client_id
+                response = await self._http.request(
+                    method,
                     f"{self.base_url}{path}",
                     params=query,
+                    json=json_body,
                     follow_redirects=follow_redirects,
-                    headers={"Accept": "application/json" if accept_json else "*/*"},
+                    headers=headers,
                 )
             except httpx.TimeoutException as exc:
                 raise SimklApiError(f"SIMKL timeout at {path}") from exc
@@ -309,6 +333,62 @@ class SimklClient:
             return response
 
         raise SimklApiError(f"SIMKL request to {path} failed after retries")
+
+    async def request_pin(self) -> dict[str, Any]:
+        """Start SIMKL's PIN authorization flow."""
+        response = await self._request("/oauth/pin", {})
+        if response.status_code != 200:
+            raise SimklApiError(f"SIMKL PIN request failed with status {response.status_code}")
+        data = response.json()
+        if data.get("result") != "OK" or not data.get("user_code"):
+            raise SimklApiError(data.get("message") or "SIMKL did not return an authorization code")
+        return data
+
+    async def check_pin(self, user_code: str) -> Optional[str]:
+        """Return the access token once a PIN has been authorized, else ``None``."""
+        response = await self._request(f"/oauth/pin/{user_code}", {})
+        if response.status_code != 200:
+            raise SimklApiError(f"SIMKL PIN check failed with status {response.status_code}")
+        data = response.json()
+        if data.get("result") == "OK" and data.get("access_token"):
+            return str(data["access_token"])
+        return None
+
+    async def post_user_data(
+        self, path: str, payload: dict[str, Any], access_token: str, *, params: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """POST an authenticated Sync API payload and return its JSON response."""
+        if not access_token:
+            raise ValueError("Missing SIMKL access token.")
+        logger.debug(
+            "SIMKL write prepared path=%s query=%s payload_summary=%s",
+            path, params or {}, _payload_summary(payload),
+        )
+        response = await self._request(
+            path, params or {}, method="POST", json_body=payload, access_token=access_token,
+        )
+        request = response.request
+        logger.debug(
+            "SIMKL write request method=%s path=%s query_keys=%s content_type=%s "
+            "body_bytes=%d body=%s",
+            request.method,
+            request.url.path,
+            sorted(request.url.params.keys()),
+            request.headers.get("content-type", ""),
+            len(request.content),
+            request.content.decode("utf-8", errors="replace")[:20_000],
+        )
+        logger.debug(
+            "SIMKL write response path=%s status=%d body=%s",
+            path, response.status_code, response.text[:20_000],
+        )
+        if not response.is_success:
+            detail = response.text[:500]
+            raise SimklApiError(f"SIMKL write to {path} failed with status {response.status_code}: {detail}")
+        data = response.json()
+        if not isinstance(data, dict):
+            raise SimklApiError(f"SIMKL write to {path} returned an invalid response")
+        return data
 
     # -- search / redirect --------------------------------------------------
 

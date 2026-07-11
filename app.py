@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -29,13 +32,21 @@ from src.config import CONFIG
 from src.job_manager import JobManager
 from src.pipeline import Job, create_job
 from src.records import (
+    WATCH_STATUSES,
     build_download,
     build_simkl_csv_export,
     clean_id,
     normalize_record_type,
+    normalize_watch_status,
     validate_manual_records,
 )
 from src.simkl_client import SimklClient, clean_imdb_id, clean_numeric_id
+from src.simkl_sync import (
+    build_direct_sync_plan,
+    build_failed_import_csv,
+    direct_sync_issue_reasons,
+    sync_job_directly,
+)
 from src.sqlite_store import SqliteStore
 
 #: Maps a record's internal visual status to the label shown in the grid.
@@ -44,6 +55,30 @@ STATUS_LABELS = {"found": "Matched", "pending": "Edited", "not_found": "Unmatche
 #: Minimum time between progress-bar UI updates, to avoid flooding the
 #: websocket connection when processing thousands of CSV rows/records.
 PROGRESS_THROTTLE_SECONDS = 0.1
+DEBUG_LOG_PATH = Path("data/tvtime_simkl.debug.log")
+
+
+def configure_debug_logging() -> None:
+    """Write detailed API diagnostics locally without logging credentials."""
+    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("tvtime_simkl")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    if any(isinstance(handler, RotatingFileHandler) for handler in logger.handlers):
+        return
+    handler = RotatingFileHandler(
+        DEBUG_LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8",
+    )
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+    ))
+    logger.addHandler(handler)
+    logger.info("Debug logging initialized at %s", DEBUG_LOG_PATH.resolve())
+
+
+configure_debug_logging()
+logger = logging.getLogger("tvtime_simkl.app")
 
 store = SqliteStore(CONFIG.db_path)
 job_manager = JobManager(store)
@@ -100,7 +135,10 @@ def build_grid_rows(job: Job, status_filter: str, search_text: str) -> list[dict
             continue
 
         visual_status = record.visual_status()
-        if status_filter != "all" and status_filter != visual_status:
+        direct_issues = direct_sync_issue_reasons(record)
+        if status_filter == "direct_issue" and not direct_issues:
+            continue
+        if status_filter not in ("all", "direct_issue") and status_filter != visual_status:
             continue
 
         if query:
@@ -116,6 +154,8 @@ def build_grid_rows(job: Job, status_filter: str, search_text: str) -> list[dict
             details += f" · confidence: {record.confidence}%"
         if record.reason:
             details += f" · {record.reason}"
+        if direct_issues:
+            details += " · direct sync: " + "; ".join(direct_issues)
 
         rows.append({
             "id": record.id,
@@ -126,6 +166,7 @@ def build_grid_rows(job: Job, status_filter: str, search_text: str) -> list[dict
             ),
             "delete": "🗑",
             "type": record.simkl_type,
+            "watch_status": record.watch_status,
             "title": record.title,
             "year": record.year or "",
             "simkl_id": record.input_simkl_id,
@@ -140,7 +181,9 @@ def build_grid_rows(job: Job, status_filter: str, search_text: str) -> list[dict
 
 #: Columns included in the CSV export, in order (the grid's "google"/"delete"
 #: action columns are UI-only and make no sense in an exported file).
-CSV_EXPORT_FIELDS = ["status_label", "type", "title", "year", "simkl_id", "imdb_id", "tvdb_id", "simkl_title", "details"]
+CSV_EXPORT_FIELDS = [
+    "status_label", "type", "watch_status", "title", "year", "simkl_id", "imdb_id", "tvdb_id", "simkl_title", "details",
+]
 
 
 def build_export_csv(job: Job, status_filter: str, search_text: str) -> bytes:
@@ -166,12 +209,21 @@ def build_grid_options() -> dict[str, Any]:
     }
     return {
         "columnDefs": [
-            {"headerName": "Status", "field": "status_label", "width": 110, "pinned": "left"},
+            {"headerName": "Match", "field": "status_label", "width": 110, "pinned": "left"},
             {"headerName": "🔍", "field": "google", "headerTooltip": "Search this title on IMDb (via Google)", **action_column},
             {"headerName": "🗑", "field": "delete", "headerTooltip": "Remove this title from the export", **action_column},
             {
                 "headerName": "Type", "field": "type", "width": 100, "editable": True,
                 "cellEditor": "agSelectCellEditor", "cellEditorParams": {"values": ["tv", "movie", "anime"]},
+            },
+            {
+                "headerName": "Watch status", "field": "watch_status", "width": 145, "editable": True,
+                "cellEditor": "agSelectCellEditor", "cellEditorParams": {"values": list(WATCH_STATUSES)},
+                "headerTooltip": "SIMKL list state: watching, completed, on hold, dropped, or plan to watch",
+                ":valueFormatter": (
+                    "(params) => ({watching:'Watching',completed:'Completed',hold:'On hold',"
+                    "dropped:'Dropped',plantowatch:'Plan to watch'}[params.value] || params.value)"
+                ),
             },
             {"headerName": "TV Time title", "field": "title", "flex": 2, "minWidth": 220},
             {"headerName": "Year", "field": "year", "width": 90},
@@ -223,6 +275,7 @@ def index() -> None:
         "job": None,
         "status_filter": "all",
         "search_text": "",
+        "simkl_access_token": "",
     }
 
     with ui.column().classes("w-full max-w-3xl mx-auto gap-4 p-4"):
@@ -253,9 +306,9 @@ def index() -> None:
                         .props("accept=.zip flat bordered").classes("max-w-sm")
                     tvtime_file_label = ui.label("No file selected yet").classes("text-xs text-gray-500")
                 with ui.column().classes("gap-1"):
-                    ui.upload(label="TV Time Out extra data (.zip, optional)", on_upload=handle_tvtime_out_upload, auto_upload=True) \
+                    ui.upload(label="TV Time Out status + IDs (.zip, optional)", on_upload=handle_tvtime_out_upload, auto_upload=True) \
                         .props("accept=.zip flat bordered").classes("max-w-sm")
-                    tvtime_out_file_label = ui.label("Optional - none selected").classes("text-xs text-gray-500")
+                    tvtime_out_file_label = ui.label("Needed only to preserve show states automatically").classes("text-xs text-gray-500")
 
             client_id_input = ui.input("SIMKL client_id", value=CONFIG.simkl_client_id).classes("w-full max-w-md")
             with ui.row().classes("gap-6"):
@@ -342,8 +395,16 @@ def index() -> None:
             ui.label(summary_text(job)).classes("text-sm text-gray-700")
 
             with ui.row().classes("items-center gap-2 flex-wrap"):
+                direct_issue_count = sum(
+                    bool(direct_sync_issue_reasons(record))
+                    for record in job.records
+                    if not record.excluded
+                )
                 filter_toggle = ui.toggle(
-                    {"all": "All", "found": "Matched", "pending": "Edited", "not_found": "Unmatched"},
+                    {
+                        "all": "All", "found": "Matched", "pending": "Edited", "not_found": "Unmatched",
+                        "direct_issue": f"Direct sync issues ({direct_issue_count})",
+                    },
                     value=state["status_filter"],
                 )
                 search_input = ui.input("Search by title or ID").classes("w-64")
@@ -380,6 +441,7 @@ def index() -> None:
                     record.input_imdb_id = clean_imdb_id(row.get("imdb_id", ""))
                     record.input_tvdb_id = clean_numeric_id(row.get("tvdb_id", ""))
                     record.simkl_type = normalize_record_type(row.get("type") or record.simkl_type)
+                    record.watch_status = normalize_watch_status(row.get("watch_status"), record.watch_status)
 
             async def refresh_rows() -> None:
                 await sync_grid_edits_into_records()
@@ -422,11 +484,12 @@ def index() -> None:
             validation_progress_bar = make_progress_bar()
             validation_progress_bar.visible = False
 
-            async def collect_pending_edits() -> list[dict[str, str]]:
+            async def collect_pending_edits() -> tuple[list[dict[str, str]], int]:
                 """Pull whatever is currently in the grid (including in-progress edits)."""
                 edited_rows = await grid.get_client_data()
                 by_id = job.records_by_id()
                 updates = []
+                watch_status_changes = 0
                 for row in edited_rows:
                     record = by_id.get(row["id"])
                     if record is None:
@@ -435,6 +498,10 @@ def index() -> None:
                     imdb_id = clean_imdb_id(row.get("imdb_id", ""))
                     tvdb_id = clean_numeric_id(row.get("tvdb_id", ""))
                     simkl_type = normalize_record_type(row.get("type") or record.simkl_type)
+                    watch_status = normalize_watch_status(row.get("watch_status"), record.watch_status)
+                    if watch_status != record.watch_status:
+                        record.watch_status = watch_status
+                        watch_status_changes += 1
                     changed = (
                         simkl_id != (record.input_simkl_id or "")
                         or imdb_id != (record.input_imdb_id or "")
@@ -446,7 +513,7 @@ def index() -> None:
                             "id": row["id"], "simkl_id": simkl_id, "imdb_id": imdb_id,
                             "tvdb_id": tvdb_id, "simkl_type": simkl_type,
                         })
-                return updates
+                return updates, watch_status_changes
 
             async def handle_validate_changed() -> None:
                 client_id = client_id_input.value.strip()
@@ -454,8 +521,13 @@ def index() -> None:
                     ui.notify("Enter a SIMKL client_id above before re-checking.", type="warning")
                     return
 
-                updates = await collect_pending_edits()
+                updates, watch_status_changes = await collect_pending_edits()
                 if not updates:
+                    if watch_status_changes:
+                        await job_manager.persist(job)
+                        render_review.refresh(job)
+                        ui.notify(f"Saved {watch_status_changes} watch-status change(s).", type="positive")
+                        return
                     ui.notify("Nothing to re-check - no rows were edited.")
                     return
 
@@ -488,7 +560,7 @@ def index() -> None:
                 """Apply any in-progress grid edits to the records, then optionally
                 cache confirmed matches locally before an export is generated.
                 """
-                updates = await collect_pending_edits()
+                updates, _watch_status_changes = await collect_pending_edits()
                 by_id = job.records_by_id()
                 for update in updates:
                     record = by_id[update["id"]]
@@ -531,12 +603,156 @@ def index() -> None:
                 await job_manager.persist(job)
                 render_review.refresh(job)
 
+            async def handle_connect_simkl() -> None:
+                client_id = client_id_input.value.strip()
+                if not client_id:
+                    ui.notify("Enter a SIMKL client_id above first.", type="warning")
+                    return
+
+                try:
+                    async with SimklClient(
+                        client_id, min_delay_ms=CONFIG.simkl_api_delay_ms, timeout_ms=CONFIG.simkl_api_timeout_ms,
+                    ) as client:
+                        pin = await client.request_pin()
+                except Exception as exc:  # noqa: BLE001
+                    ui.notify(f"Could not start SIMKL authorization: {exc}", type="negative")
+                    return
+
+                verification_url = pin.get("verification_uri") or pin.get("verification_url") or "https://simkl.com/pin/"
+                user_code = str(pin["user_code"])
+
+                with ui.dialog() as auth_dialog, ui.card().classes("gap-3"):
+                    ui.label("Connect your SIMKL account").classes("text-lg font-semibold")
+                    ui.label(user_code).classes("text-3xl font-mono font-bold")
+                    ui.link("Open SIMKL authorization", verification_url, new_tab=True)
+                    auth_status = ui.label("").classes("text-sm text-gray-600")
+
+                    async def handle_check_authorization() -> None:
+                        check_button.disable()
+                        auth_status.set_text("Checking authorization…")
+                        try:
+                            async with SimklClient(
+                                client_id, min_delay_ms=CONFIG.simkl_api_delay_ms,
+                                timeout_ms=CONFIG.simkl_api_timeout_ms,
+                            ) as client:
+                                token = await client.check_pin(user_code)
+                        except Exception as exc:  # noqa: BLE001
+                            auth_status.set_text(f"Authorization check failed: {exc}")
+                            check_button.enable()
+                            return
+                        if not token:
+                            auth_status.set_text("Still waiting for authorization on SIMKL.")
+                            check_button.enable()
+                            return
+                        state["simkl_access_token"] = token
+                        auth_dialog.close()
+                        render_review.refresh(job)
+                        ui.notify("SIMKL account connected.", type="positive")
+
+                    with ui.row().classes("gap-2"):
+                        check_button = ui.button("Check authorization", on_click=handle_check_authorization)
+                        ui.button("Cancel", on_click=auth_dialog.close).props("flat")
+                auth_dialog.open()
+
+            async def handle_direct_sync() -> None:
+                access_token = state.get("simkl_access_token") or ""
+                if not access_token:
+                    ui.notify("Connect your SIMKL account first.", type="warning")
+                    return
+
+                await sync_grid_edits_into_records()
+                plan = build_direct_sync_plan(
+                    job.backup, job.records,
+                    include_tv=include_tv_checkbox.value,
+                    include_movies=include_movies_checkbox.value,
+                    include_anime=include_anime_checkbox.value,
+                )
+                history_items = sum(
+                    len(batch.get(bucket, []))
+                    for batch in plan.history_batches
+                    for bucket in ("shows", "anime", "movies")
+                )
+                status_items = sum(
+                    len(batch.get(bucket, []))
+                    for batch in plan.status_batches
+                    for bucket in ("shows", "anime", "movies")
+                )
+                with ui.dialog() as confirm_dialog, ui.card().classes("gap-3"):
+                    ui.label("Import this reviewed history directly into SIMKL?").classes("text-lg font-semibold")
+                    ui.label(
+                        f"Ready to sync {history_items} watched titles and apply {status_items} watchlist states. "
+                        "The app will not remove existing history.",
+                    ).classes("max-w-lg text-sm text-gray-700")
+                    if plan.failed_items:
+                        ui.label(
+                            f"A detailed CSV report will be downloaded automatically for the "
+                            f"{len(plan.failed_items)} item(s) that need separate handling, plus any item SIMKL rejects. "
+                            "You can inspect the affected titles now in the Direct sync issues view.",
+                        ).classes("max-w-lg text-sm text-amber-800")
+                    with ui.row().classes("gap-2"):
+                        ui.button("Import now", on_click=lambda: confirm_dialog.submit(True)).props("color=primary")
+                        ui.button("Cancel", on_click=lambda: confirm_dialog.submit(False)).props("flat")
+                if not await confirm_dialog:
+                    return
+
+                direct_sync_button.disable()
+                validation_progress_bar.visible = True
+                validation_progress_bar.set_value(0)
+                report_progress = make_throttled_progress(validation_phase_label, validation_progress_bar)
+                try:
+                    async with SimklClient(
+                        client_id_input.value.strip(), min_delay_ms=CONFIG.simkl_api_delay_ms,
+                        timeout_ms=CONFIG.simkl_api_timeout_ms,
+                    ) as client:
+                        result = await sync_job_directly(
+                            client, access_token, job.backup, job.records,
+                            include_tv=include_tv_checkbox.value,
+                            include_movies=include_movies_checkbox.value,
+                            include_anime=include_anime_checkbox.value,
+                            progress=report_progress,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Direct SIMKL import failed")
+                    ui.notify(
+                        f"Direct SIMKL import failed: {exc}. Debug log: {DEBUG_LOG_PATH.resolve()}",
+                        type="negative", close_button=True, timeout=0,
+                    )
+                    direct_sync_button.enable()
+                    validation_progress_bar.visible = False
+                    return
+
+                await job_manager.persist(job)
+                validation_progress_bar.visible = False
+                direct_sync_button.enable()
+                message = (
+                    f"Direct import complete: {result.history_batches} history batch(es), "
+                    f"{result.status_batches} status batch(es)."
+                )
+                if result.failed_items:
+                    filename, csv_bytes = build_failed_import_csv(result)
+                    ui.download(csv_bytes, filename)
+                    message += f" Downloaded a CSV report with {len(result.failed_items)} item(s) to review."
+                ui.notify(message, type="warning" if result.failed_items else "positive")
+
             with ui.row().classes("gap-2"):
                 validate_button = ui.button("Re-check edited rows", on_click=handle_validate_changed)
                 ui.button("Remember these matches", on_click=handle_save_to_db)
                 ui.button("Download SIMKL backup", on_click=handle_generate_zip).props("color=primary")
                 ui.button("Download SIMKL CSV", on_click=handle_generate_simkl_csv).props("outline") \
                     .tooltip("SIMKL's own bulk-import CSV format (simkl.com/apps/import) - a simpler alternative to the JSON backup")
+
+            with ui.row().classes("items-center gap-2"):
+                if state.get("simkl_access_token"):
+                    ui.label("SIMKL connected").classes("text-sm text-green-700")
+                    direct_sync_button = ui.button("Import directly to SIMKL", on_click=handle_direct_sync) \
+                        .props("color=positive icon=cloud_upload")
+                else:
+                    ui.button("Connect SIMKL", on_click=handle_connect_simkl).props("outline icon=link")
+                ui.link(
+                    "Reset SIMKL watch history",
+                    "https://simkl.com/settings/login/clean-or-delete/",
+                    new_tab=True,
+                ).classes("text-sm")
 
 
             if job.report_rows:

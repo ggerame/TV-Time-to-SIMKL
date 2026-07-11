@@ -86,3 +86,22 @@ def test_include_rewatches_false_excludes_rewatch_entries():
 
     assert len(result.simkl_backup["shows"]) == 1
     assert result.simkl_backup["shows"][0]["is_rewatch"] is False
+
+
+def test_movie_sentinel_year_is_reconciled_with_matching_planned_entry():
+    zip_bytes = make_zip({
+        "tracking-prod-records.csv": (
+            "type,entity_type,movie_name,release_date,updated_at,rewatch_count,uuid\n"
+            "watch,movie,Boys,0001-01-01,2020-04-20 10:00:00,,watched\n"
+            "towatch,movie,Boys,2014-01-01,2020-04-19 10:00:00,,planned\n"
+        ),
+    })
+    loaded = load_tvtime_data(zip_bytes)
+    result = convert_tvtime_to_simkl_json(loaded, ConversionOptions())
+
+    assert len(result.simkl_backup["movies"]) == 1
+    movie = result.simkl_backup["movies"][0]
+    assert movie["movie"] == {"title": "Boys", "year": 2014}
+    assert movie["status"] == "completed"
+    assert movie["last_watched_at"] == "2020-04-20T10:00:00Z"
+    assert movie["added_to_watchlist_at"] == "2020-04-19T10:00:00Z"

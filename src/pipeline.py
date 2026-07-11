@@ -45,6 +45,21 @@ class Job:
     summary: dict[str, Any]
     notes: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        """Restore watch states for jobs saved before records stored that field."""
+        from .records import normalize_watch_status
+
+        for record in self.records:
+            if record.watch_status:
+                continue
+            for list_name, index in record.refs:
+                entries = self.backup.get(list_name, [])
+                if index >= len(entries) or entries[index].get("is_rewatch"):
+                    continue
+                record.watch_status = normalize_watch_status(entries[index].get("status"))
+                if record.watch_status:
+                    break
+
     def records_by_id(self) -> dict[str, MediaRecord]:
         return {record.id: record for record in self.records}
 
@@ -60,7 +75,7 @@ async def create_job(
     store: Optional[SqliteStore],
     progress: ProgressCallback = _noop_progress,
 ) -> Job:
-    """Run the full pipeline: parse -> convert -> prefill IDs -> enrich via SIMKL."""
+    """Run the full pipeline: parse -> convert -> apply optional metadata -> enrich via SIMKL."""
     progress("reading TV Time export", 0, 1)
     loaded = load_tvtime_data(tvtime_zip_bytes)
 
@@ -78,7 +93,7 @@ async def create_job(
         try:
             tv_time_out = parse_tvtime_out_zip(tvtime_out_zip_bytes)
             applied = apply_tvtime_out_mappings(records, tv_time_out.mappings)
-            notes.append(f"{applied} records were prefilled with IMDb/TVDB IDs from TV Time Out by Refract.")
+            notes.append(f"{applied} records were enriched with IDs and/or list status from TV Time Out by Refract.")
             if tv_time_out.stats.conflicts:
                 notes.append(f"{tv_time_out.stats.conflicts} TV Time Out ID mappings were ignored because they had conflicting IDs.")
         except Exception as exc:  # noqa: BLE001 - optional input, never fail the whole run because of it

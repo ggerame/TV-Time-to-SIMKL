@@ -74,6 +74,7 @@ def test_normalize_date_variants():
 
 def test_year_from_date():
     assert year_from_date("2015-06-01") == 2015
+    assert year_from_date("0001-01-01") is None
     assert year_from_date("") is None
 
 

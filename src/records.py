@@ -42,6 +42,16 @@ def _noop_progress(_phase: str, _done: int, _total: int) -> None:
 LIST_NAME_TO_TYPE = {"shows": "tv", "anime": "anime", "movies": "movie"}
 #: Reverse mapping: SIMKL "type" -> the backup list an entry belongs to for export.
 TYPE_TO_LIST_NAME = {"tv": "shows", "anime": "anime", "movie": "movies"}
+#: Watch-list states accepted by SIMKL's JSON import format.
+WATCH_STATUSES = ("watching", "completed", "hold", "dropped", "plantowatch")
+
+
+def normalize_watch_status(value: Any, fallback: str = "") -> str:
+    """Return a supported SIMKL watch-list state without inventing one."""
+    status = str(value or "").strip().lower().replace(" ", "")
+    aliases = {"onhold": "hold", "paused": "hold", "planned": "plantowatch", "towatch": "plantowatch"}
+    status = aliases.get(status, status)
+    return status if status in WATCH_STATUSES else fallback
 
 
 @dataclass
@@ -74,6 +84,7 @@ class MediaRecord:
     verified_tvdb_id: str = ""
 
     simkl_type: str = "tv"
+    watch_status: str = ""
     simkl_title: str = ""
     simkl_year: Optional[int] = None
 
@@ -204,6 +215,12 @@ def extract_media_records(backup: dict[str, Any]) -> list[MediaRecord]:
                     simkl_type=LIST_NAME_TO_TYPE[list_name],
                 )
                 records[record_id] = record
+
+            entry_status = normalize_watch_status(entry.get("status"))
+            if not entry.get("is_rewatch") and entry_status:
+                record.watch_status = entry_status
+            elif not record.watch_status:
+                record.watch_status = entry_status
 
             record.refs.append((list_name, index))
             record.occurrences += 1
@@ -497,6 +514,10 @@ def apply_records_to_backup(backup: dict[str, Any], records: list[MediaRecord]) 
             target_list = TYPE_TO_LIST_NAME.get(owner.simkl_type, list_name) if owner else list_name
 
             if owner is not None:
+                watch_status = normalize_watch_status(owner.watch_status)
+                if watch_status and not entry.get("is_rewatch"):
+                    entry["status"] = watch_status
+
                 ids: dict[str, Any] = {}
                 simkl_id = _safe_int(owner.input_simkl_id)
                 if simkl_id is not None:
@@ -556,7 +577,13 @@ def build_download(
 SIMKL_CSV_HEADER = ["simkl_id", "TVDB_ID", "TMDB", "IMDB_ID", "MAL_ID", "Type", "Title", "Year", "LastEpWatched", "Watchlist", "WatchedDate", "Rating", "Memo"]
 
 #: Maps this app's internal watch status to SIMKL's CSV vocabulary.
-_SIMKL_CSV_WATCHLIST_LABELS = {"watching": "watching", "completed": "completed", "plantowatch": "plan to watch"}
+_SIMKL_CSV_WATCHLIST_LABELS = {
+    "watching": "watching",
+    "completed": "completed",
+    "hold": "on hold",
+    "dropped": "dropped",
+    "plantowatch": "plan to watch",
+}
 
 _LAST_WATCHED_RE = re.compile(r"^S(\d+)E(\d+)$", re.IGNORECASE)
 

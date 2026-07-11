@@ -1,16 +1,58 @@
+# Python environments, bytecode, packaging, tests, and coverage.
 .venv/
+venv/
+env/
 __pycache__/
-*.pyc
-.env
+*.py[cod]
 *.egg-info/
+build/
+dist/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+/.bash_profile
+/.bashrc
+/.gitconfig
+/.gitmodules
+/.profile
+/.zprofile
+/.zshrc
+/.mcp.json
+/.ripgreprc
+
+# Editor and OS metadata.
+/.idea
+/.vscode
+.DS_Store
+Thumbs.db
+
+# Runtime logs.
+*.log
+*.log.*
 
 # Local SQLite database (ID mapping cache + jobs) - contains personal data.
 data/
+*.db
+*.db-journal
+*.sqlite
 *.sqlite3
+*.sqlite-journal
+*.sqlite3-journal
 
 # Personal data - never commit real exports or generated backups.
 *.zip
 SimklBackup*.json
 not_found*.json
 output/
+SimklDirectImportFailures-*.csv
+SimklImport-*.csv
